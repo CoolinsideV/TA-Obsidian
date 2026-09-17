@@ -54,7 +54,6 @@ $$\vec{V} = P_{camera} - P_{world\_pos}$$
 $$\vec{N} \cdot \vec{V} = \cos(\theta)$$
 
 - **应用**：`dot(normal_world, view_world)`。夹角越小（看中心），结果越接近 $1$；夹角越大（看边缘），结果越接近 $0$。
-- ![[{3B9E620A-3E0B-4707-BBA5-34B1B6D09D35}.png]]
 
 - **反转逻辑**：为了实现边缘亮、中间暗，使用 `1.0 - NdotV` 将结果反转，这就是**菲涅尔效应 (Fresnel Effect)** 的基础模拟。
 

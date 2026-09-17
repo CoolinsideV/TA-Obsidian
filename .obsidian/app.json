@@ -1,6 +1,7 @@
 {
   "promptDelete": false,
   "alwaysUpdateLinks": true,
+  "attachmentFolderPath": "Photos",
   "pdfExportSettings": {
     "includeName": true,
     "pageSize": "A4",
