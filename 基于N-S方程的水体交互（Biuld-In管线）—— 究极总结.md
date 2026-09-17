@@ -1,0 +1,402 @@
+## 1. 现象引入与痛点陈述
+
+在游戏中，无论是玩家趟过泥潭留下的涟漪，还是法术引爆后的烟雾卷动，本质上都在试图欺骗玩家的眼睛，让他们相信屏幕里有一团“遵循物理法则的物质”。
+
+- **视觉呈现**：当鼠标（游戏内射线检测点）在屏幕上滑动时，不仅会在当前位置留下颜色，更重要的是会赋予该区域一个**速度向量**。这个速度不会僵硬地停留在原地，而是会推动周围的流体产生漩涡，随后因为黏性（Viscosity）缓缓衰减。
+
+> [!warning] 为什么要用ComputeShader
+> 
+> 传统的流体力学偏微分方程（PDE）求解是一个天文数字级别的运算。假设你的分辨率设置是 $1024 \times 1024$，在 C# 端的 `Update` 中，每一帧都要经历：
+> 
+> 1 次外力 + 1 次平流 + 20 次黏性迭代 + 1 次散度计算 + 20 次压力迭代 + 1 次梯度计算 = **44 次全屏遍历**。
+> 
+> $104 万 \times 44 \approx 4500 万$ 次网格读写/帧。
+> 
+> 这就是为什么绝对不能用 CPU 的 `for` 循环。Compute Shader 的 `[numthreads(8,8,1)]` 将这 104 万个网格切割成了 $128 \times 128$ 个线程组（Thread Group），将计算负载均摊给显卡成千上万个流处理器同步执行，这是在实时渲染中跑通物理模拟的唯一解。
+
+
+
+---
+
+
+## 2. 核心原理剖析
+
+所有的核函数（Kernel），拼凑起来其实就是在解一个**不可压缩的N-S方程**。
+
+在这份代码中，流体被看作是由无数个小方格（像素）组成的网格场（欧拉视角 —— 关注空间中的固定位置，观察随着时间推移，流经该位置的流体状态发生了什么变化）。每个方格里记录着两个关键属性：
+
+1. **速度场（矢量场） $\mathbf{u}$**（由 `v0`, `v1` 贴图存储，RG通道分别代表 X 和 Y 方向的速度）。
+
+2. **压力场（标量场） $p$**（由 `p0`, `p1` 贴图存储，R通道标量）。
+
+
+N-S 方程的动量守恒部分长这样：
+
+$$\frac{\partial \mathbf{u}}{\partial t} = -(\mathbf{u} \cdot \nabla)\mathbf{u} + \nu \nabla^2 \mathbf{u} - \frac{1}{\rho}\nabla p + \mathbf{F}$$
+
+先不管嘛，接下来的 5 个阶段完美对应了等式右边的 4 项，我们用通俗的话来翻译它：
+
+- 速度的变化率 $\frac{\partial \mathbf{u}}{\partial t}$ =
+
+    - **平流项 $-(\mathbf{u} \cdot \nabla)\mathbf{u}$**：水被自身的速度冲着走（对应 `Advect`）。
+    
+    - **扩散项 $\nu \nabla^2 \mathbf{u}$**：浓稠的流体（如糖浆）会把速度传染给周围（对应 `Diffusion`）。
+    
+    - **压力项 $- \frac{1}{\rho}\nabla p$**：水往低压处流，用来保证水不被压缩（对应 `Divergence`, `Pressure`, `Gradient`，这叫投影法）。
+    
+    - **外力项 $\mathbf{F}$**：玩家鼠标的搅动（对应 `Force`）。
+
+
+为了在计算机里求解，图形学先驱 Jos Stam 提出了一种“算符分裂（Operator Splitting）”法，就是把这个复杂的公式拆成一步步来算：
+
+$$\mathbf{u}_0 \xrightarrow{\text{Add Force}} \mathbf{u}_1 \xrightarrow{\text{Advect}} \mathbf{u}_2 \xrightarrow{\text{Diffuse}} \mathbf{u}_3 \xrightarrow{\text{Project}} \mathbf{u}_4$$
+
+
+所以你可以通俗的理解为：结果 = Force + Advect + Diffuse +Project
+
+---
+
+
+## 3. 具体实现方案（2D流体模拟）
+
+
+### 第一步：外力注入 (Force)
+
+> 举个栗子：你往水里扔了一块石头，石头落点周围的水瞬间获得了速度。
+
+流体上的每一个点都有一个速度，而我们要改变某一点的速度值，再将改变的速度值转换到某一张图的UV上——这样就能显示的看出来它的流体模拟效果
+
+
+![[{C1347A39-EE46-4520-AD46-9F9D016C7D40}.png]]
+
+F：自定义施加在流体上的力
+deltaTime：unity可以拿到
+exp函数：
+X-Xp：当前某点像素位置和上一次像素点的位置
+
+
+
+不能用传统的RGB8这种图片来描述，需要RHalf或者RFloat这种可以同时表示正负值的通道
+![[{E591632A-B3D0-43AB-B6CA-5EF3E446E3AD}.png]]
+		  生成的静态图（两个通道的RGHalf或RGFloat），表明每个像素的受力情况
+
+
+
+我们这里用鼠标滑动（射线检测）来模拟外力
+
+
+### 在c#端定义：
+
+力的大小，
+半径（经验参数，可以是1/贴图大小，也可以更根据运用到的模型大小来调节）
+两张图：一张输入v0，一张输出v1（方便我们观察）
+
+
+Start（）函数里用CreateTextures（）；方法创建贴图
+
+
+流体力学模拟中，需要创建非常多张分辨率相同的贴图（比如速度场 `v0` 和 `v1`、压力场 `p0` 和 `p1`、散度场 `div`、颜色场 `col0` 和 `col1` 等），RenderTexture CtreateTexture（）{} 这个函数是你为了方便 Compute Shader 频繁创建开启了“读写权限”的贴图而写的一个**快捷封装指令**
+
+
+![[{0C1658B6-5E6F-49BA-BA8D-E278CFCBF69F}.png]]
+获取内核索引 / 预缓存句柄，避免在渲染主循环中产生昂贵的字符串哈希查找开销。
+
+![[{F91F6E83-21AD-478F-95D9-88D0BFE7AA10}.png]]
+lastpos是记录按下的那一刻的值，一旦开始移动就是curpos，相减得到力的方向
+
+
+![[{D6307C4A-E9AE-46F2-94AA-C3BE380105A4}.png]]
+把你的鼠标变成一根从屏幕射向游戏世界的激光笔：基于屏幕空间射线的物理空间查询（Spatial Query），与纹理空间（Texture Space）的 UV 映射
+
+![[{D874D084-CC84-4C50-98EB-7CF9BBA39BFA}.png]]
+动量构建 + GPU 调度
+
+
+
+**乒乓缓冲**
+
+为了看到持续、丝滑的流体效果，我们必须准备两张贴图：
+
+1. **第一回合**：把旧状态 `v0` 设为只读（`input0`），GPU 算完的新状态全部写进一张全新的白纸 `v1`（`output`）里。
+
+2. **准备第二回合**：下一帧（或者下一次迭代）开始时，刚刚算好的 `v1` 变成了我们需要读取的“旧状态”，而 `v0` 里的老数据已经没用了，可以当白纸写。
+![[{93FA223B-D19F-4016-AFEC-88581B81E48A}.png]]
+![[{9B2CB049-8096-401F-9397-03D24AC356E5}.png]]
+迭代数据（置换）方便下一帧迭代（乒乓缓冲）：C# 的引用传递（`ref`）实现了纹理指针的零拷贝交换，为 Compute Shader 构建了经典的**乒乓缓冲（Ping-Pong Buffer）**，从而以最低的性能开销解决了 GPU 并发计算时的读写竞争问题
+
+
+
+
+```
+// 核心逻辑：高斯衰减外力
+float2 deltaPos = forcePos - pos;
+// 用指数函数计算出一个从中心向外平滑衰减的权重
+float2 velocity = forceVector * exp(-dot(deltaPos,deltaPos) / radius) * deltaTime;
+output[id] = input0[id] + velocity;
+```
+
+这里利用了高斯分布方程 $e^{-\frac{x^2+y^2}{r}}$。`dot(deltaPos, deltaPos)` 就是距离的平方，距离 `forcePos` 越远，`exp` 的值就越接近 0。这是一个非常柔和的力场注入，不会让速度场出现锐利的边缘。
+
+OnValidate()：编辑器回调，当在 Inspector 面板修改参数时自动触发，将新数值（如 radius）实时同步至 GPU，实现“所见即所得”的调参体验。
+
+
+
+### 在ComputeShader端定义：
+
+基础的computeshader书写规范这里不再赘述
+```glsl
+// 1. 声明内核
+#pragma kernel ComputeFunction
+
+// 2. 声明变量和读写缓冲区
+// RWTexture2D<float4> Result; // 假设的输出纹理
+float2 myVariable;
+float myRadius;
+
+// 3. 设置线程组大小
+[numthreads(8, 8, 1)]
+
+// 4. 主函数入口
+void ComputeFunction (uint3 id : SV_DispatchThreadID)
+{
+    // 5. 插入实际计算逻辑并输出结果
+    // 例如：Result[id.xy] = float4(1.0, 0.0, 0.0, 1.0);
+}
+```
+
+接收 C# 传过来的那两张物理计算贴图（存储着二维速度场，所以用 `float2`）
+![[{E6104A7A-F888-4DDF-859A-FD20310B27A7}.png]]
+`RW` 是 **Read/Write（可读写）** 的缩写。加上它之后，贴图会被升级为 **UAV (Unordered Access View)**
+
+1. **`Texture2D` (只读视图 SRV)：** 当这个RT被绑定到 `Texture2D input0` 时，GPU 对他说：“你现在扮演一个**普通的静态贴图**，只能被读取，不能被修改。” 所以，虽然它的真身是强大的 RT，但它在这一刻被“降级”当成了一张普通的 `Texture2D` 来用，为的是白嫖硬件的双线性插值。
+
+2. **`RWTexture2D` (读写视图 UAV)：** 当另一个RT被绑定到 `RWTexture2D output` 时，GPU 对他说：“火力全开！把你的读写权限全部打开，准备接收数据的狂轰滥炸！” **注意**：在 C# 创建 RT 时，你必须给它打上 `enableRandomWrite = true` 的标记，它才有资格扮演这个角色。
+
+
+
+
+把ID转换到01空间内
+（为什么要转换？ 一是利用 GPU 硬件级的双线性插值，确保流体在平流回溯采样时获得平滑过渡，避免产生马赛克与锯齿边缘；二是实现分辨率无关性，使得后续的流体力学物理公式运算完全解耦于具体的 RenderTexture 像素尺寸。）
+
+
+首先
+
+向computeshader端传入贴图的高和宽
+![[{DCCF437C-BA76-4858-8595-FC847B0C2EBE}.png]]
+
+确定纹素大小：接收 C# 传来的贴图分辨率，并计算出单个像素在 0~1 的 UV 空间中所占的绝对长度 (Texel Size)。这是后续在 UV 空间中精确采样相邻网格（上下左右移动一步）的距离基准。
+![[{566CB5F5-2DA6-40FF-9C67-D15F4214CF2D}.png]]
+
+定义一个**带参数的宏**：**将 GPU 线程的“整数像素坐标”转换为贴图采样所需的“0 到 1 的 UV 坐标”**
+![[{17DA5632-35B4-40E8-BDB0-AAE61135314B}.png]]
+
+当前这个 GPU 线程正在处理的网格像素，在整张水面贴图上的 UV 坐标（取值范围是 $0.0 \sim 1.0$）
+![[{67111C07-1A75-4041-8401-290621E4D594}.png]]
+
+
+
+### 第二步：平流 (Advection)
+
+> 举个栗子：一片树叶在水里，下一秒它会在哪？
+
+这里使用的是 **半拉格朗日法（Semi-Lagrangian）**
+
+顺向思考很容易出错（把当前的水推到下一个位置，可能会导致多个格子的水流到同一个格子，有的格子又空了）。所以我们**逆向思考**：要计算格子 A 下一秒的状态，我们要顺着 A 现在的风速，**往回找**，看看是谁流到了 A 这里。
+
+![[{55725182-5E35-4875-9610-4AED899F372C}.png]]
+
+
+```
+void Advect (uint2 id : SV_DispatchThreadID)
+{
+    // ... 边界判定略 ...
+    float2 uv = id2UV(id);
+    
+    // 【核心推导】：距离 = 速度 * 时间
+    // uv代表当前网格位置。tex2D(input0, uv) 是当前网格的速度。
+    // 我们用当前位置 减去 (速度 * 时间)，就找到了“上一帧的水是从哪里来的” (distanceUV)
+    float2 distanceUV = uv - tex2D(input0, uv) * deltaTime * advectSpeed;
+
+    // 从过去的位置，把那个地方的速度（或颜色）采样过来，覆盖给自己
+    output[id] = tex2D(input1, distanceUV);
+}
+```
+
+> [!info] ！
+> 
+> 注意这里用的是 `tex2D`（里面封装了 `.SampleLevel` 加上线性采样器 `sampler_LinearRepeat`）。算出来的 `distanceUV` 通常不会正好落在一个像素中心，而是夹在几个像素之间。此时 GPU 硬件会自动帮你做**双线性插值（Bilinear Interpolation）**，这不仅平滑了流体，还完全不消耗额外的算力！
+
+### 第三步：扩散 / 黏性 (Diffusion)
+
+> 栗子：如果有一池子蜂蜜，你搅动一下，黏性会让周围的蜂蜜跟着一起动。局部速度高的区域会把速度“平摊”给周围。
+
+数学上求解扩散方程 $\frac{\partial \mathbf{u}}{\partial t} = \nu \nabla^2 \mathbf{u}$。
+
+如果用显式欧拉法（直接用现在的速度算未来的速度），当黏度 `viscosity` 很大或 `deltaTime` 很大时，系统会直接爆炸（数值不稳定）。因此，必须使用**隐式求解法**，即构建一个线性方程组。
+
+公式离散化后长这样：
+
+$$\mathbf{u}_{i,j}^{k} = \frac{\mathbf{u}_{i-1,j}^{k+1} + \mathbf{u}_{i+1,j}^{k+1} + \mathbf{u}_{i,j-1}^{k+1} + \mathbf{u}_{i,j+1}^{k+1} + \alpha \mathbf{u}_{i,j}^{k}}{\beta}$$
+
+其中，$\alpha = \frac{(\Delta x)^2}{\nu \Delta t}$，$\beta = 4 + \alpha$。
+
+你会发现等式两边都有未知数（下一时刻的状态 $k+1$），这没法直接解。所以我们要用**雅可比迭代法（Jacobi Iteration）**，靠不断瞎猜来逼近正确答案：
+
+```
+void Diffusion (uint2 id : SV_DispatchThreadID)
+{
+    // 对应公式中的参数
+    float alpha = dx2 /(viscosity * deltaTime);
+    float beta = 4 + alpha;
+
+    // ... 采样周围上下左右 (l, r, t, b) 四个邻居的当前速度 ...
+    // c 是当前网格上一迭代步的速度
+
+    // 雅可比迭代核心：用周围邻居的速度平均一下自己
+    output[id] = (l + r + t + b + alpha * c) / beta;
+}
+```
+
+> [!tip] 迭代的意义
+> 
+> 在 C# 代码中，这段逻辑被包在 `for(int i = 0; i < diffusionInterateCount; ++i)` 里循环了 20 次。
+> 
+> 每 dispatch 一次，速度的“传染”就向外蔓延一格。20次意味着黏性的影响可以瞬间传递到 20 个像素之外，使得流体表现出一种稳定的、黏糊糊的质感。
+
+
+### 第四步：投影与质量守恒（Projection）
+
+> 物理直觉：上面三步算完后，由于数值误差和各种拉扯，水流变得“可压缩”了（比如四周的水全往中间涌，导致中间水变多，这不符合自然规律）。
+> 
+> 根据**霍奇分解定理（Helmholtz-Hodge Decomposition）**，任何一个向量场都可以拆成两部分：一个“无散度场（不压缩）” 加上 一个“标量场的梯度（压力造成的流动）”。
+> 
+> 我们的目的：**算出这个“多余的压力梯度”，然后从当前速度场里把它减掉！**
+
+
+
+这一步被拆成了三个 Kernel：
+
+#### 4.1 散度计算 (Divergence)
+
+算算每个网格里水流是“挤进来了”还是“流出去了”。
+
+
+```
+void Divergence (uint2 id : SV_DispatchThreadID)
+{
+    // ... 采样上下左右速度 ...
+    // 中心差分法计算散度：(右边横向速度 - 左边横向速度) + (上边纵向速度 - 下边纵向速度)
+    div[id] = halfdx * (r.x - l.x + t.y - b.y);
+}
+```
+
+如果 `div > 0`，说明水往外流（发散）；如果 `div < 0`，说明水往里挤。为了让水不可压缩，我们要通过施加压力，把挤进来的水原封不动地推出去。
+
+
+#### 4.2 求解压力场泊松方程 (Pressure)
+
+我们已知了网格里的拥挤程度（散度 div），现在求要施加多大的压力（Pressure）才能把它们抚平。数学上这是一个泊松方程 $\nabla^2 p = \nabla \cdot \mathbf{u}$。
+
+由于形式和上面的 Diffusion 一模一样，我们同样用**雅可比迭代**解它：
+
+
+```
+void Pressure (uint2 id : SV_DispatchThreadID)
+{
+    float alpha = -dx * dx;
+    float beta = 4;
+    
+    // c 就是上面算出来的散度 div
+    float c = tex2D(input1, uv).r;
+
+    // 不断迭代，让压力向四周扩散，直到抵消所有的散度
+    output[id] = (l + r + t + b + alpha * c) / beta;
+}
+```
+
+（C# 中同样循环迭代 20 次，计算出整个场景最终的压力分布图 `p1`）。
+
+
+#### 4.3 速度场修正 (Gradient)
+
+有了压力分布，根据“水往低压处流”，我们计算压力的梯度（即压差），并从原来的速度里减去它。
+
+
+```
+void Gradient (uint2 id : SV_DispatchThreadID)
+{
+    // ... 采样周围的压力 l, r, t, b ...
+    // c 是投影前被污染的速度
+    float2 c = tex2D(input1, uv);
+
+    // 压力的梯度就是 (右边压力-左边压力， 上边压力-下边压力)
+    // 从原速度中减去压力梯度，得到最终纯洁的、无散度的完美流体速度！
+    output[id] = c - halfdx * float2(r - l, t - b);
+}
+```
+
+
+---
+
+## 4. 边界条件与性能优化 (Edge Cases & Optimization)
+
+### 边界条件：诺伊曼与狄利克雷边界
+
+你的代码中对边界进行了非常严谨的处理，这在图形学物理模拟中极其重要，否则你的系统在几秒钟内就会因为边界的计算越界而导致整个屏幕变成 NaN（黑屏或白屏）。
+
+
+在 `Diffusion` 和 `Divergence` 中：
+
+```
+    // 处理边界越界，当处于边界的时候，取速度的反方向
+    if(id.x < 2) l = -c;
+```
+
+这属于 **Dirichlet 边界条件 (Dirichlet Boundary Condition)**，即强行指定边界上的值为某个常数。强制速度相反，相加为 0，构成了“无滑移（No-Slip）”的固体墙壁。
+
+
+在 `Pressure` 中：
+
+```
+    // 处理边界越界，当处于边界的时候，取压力的负值
+    if(id.x < 2) l = -c;
+```
+
+这属于 **纯诺伊曼边界 (Pure Neumann Boundary)**，这使得边界处的压力梯度为 0，保证流体不会无缘无故从墙壁“渗漏”出去。
+
+### 架构层面的性能调优建议
+
+尽管当前代码逻辑清晰，但在现代渲染管线中，有几处可以优化的地方：
+
+1. **消除 Kernel 中的 Branching（分支）**：
+    
+    GPU 的线程是以 Warp (通常 32 或 64 个线程) 为单位步调一致执行的。你在一个线程组内写了 `if(id.x < 2)`，会导致这组线程里边缘的几个走向 `if` 内部，而内部的几十个走向 `else`，这叫 **Warp Divergence**，会拖慢整组的执行速度。
+    
+    > [!tip] 优化法：
+    > 
+    > 可以使用两个 Compute Shader pass。第一个 pass 的 Dispatch 只分发给内部的区域（比如分发计算 $1020 \times 1020$ 的网格），不做任何边界 `if` 判断；第二个 pass 专门通过 1D 的线程组（`Dispatch(width, 1, 1)`）只覆盖最外围的一圈像素来处理边界反转。
+    
+2. **避免材质 SetTexture 的冗余绑定**：
+    
+    在 `Water.cs` 的 `Update` 中，其实有很多纹理在多次迭代中是不变的（比如 `Divergence` 的输出 `div`）。
+    
+    可以将 `cs.SetTexture` 的逻辑区分“初始化静态绑定”和“每帧动态交换绑定”。尽可能减少 CPU 到 GPU 的指令提交（Draw Call / Dispatch Call 前的准备开销）。
+    
+
+## 5. 总结与延伸思考 (Conclusion)
+
+> [!abstract] 核心总结
+> 
+> 本文拆解的系统是一个教科书级别的基于欧拉网格的二维流体解算器。它通过 **算符分裂法** 将纳维-斯托克斯方程解耦，利用 **Ping-Pong Buffer** 在 Compute Shader 中高效流转数据，并通过 **雅可比隐式求解** 确保了流体的绝对稳定。其最大优势是**能在保证高分辨率流体细节（旋涡与黏性）的同时，依靠 GPU 并行计算满足实时交互帧率要求**。
+
+**横向扩展思考（对于游戏开发）：**
+
+当你理解了这套底层逻辑，你会发现计算机图形学中的很多系统是同源的。你可以将这套代码改造后运用于：
+
+1. **大规模草地/植被交互系统 (Procedural Foliage Interaction)**：
+
+    将最终算出的速度场 `v1` 作为风力图 (Wind Map)。当角色或怪物释放技能时（注入 Force），风力以流体的方式扩散并产生旋涡，草地在 Vertex Shader 中采样这个速度场进行偏移顶点。你会得到物理极其自然、带有回旋风余波的次世代压草效果。
+
+2. **动态全局光照与体积雾 (Volumetric Fog with Fluid Dynamics)**：
+
+    将 2D 的贴图替换为 3D 纹理（`Texture3D`），将 Compute Shader 改为 3D 线程组 `[numthreads(8,8,8)]`。再向其中注入一个表示温度的“浮力场（Buoyancy）”。这就是当前 3A 大作（如《黑神话：悟空》或《艾尔登法环》）中，Boss 出场时那团能在地上翻滚、遇到石块会产生局部涡流的顶级物理体积雾的基础原型。
