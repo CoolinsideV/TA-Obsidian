@@ -8,3 +8,6 @@
 # 系统文件
 .DS_Store
 Thumbs.db
+
+# 仓库自身的旧快照副本(误放在工作目录里)
+/TA-Obsidian-master/
