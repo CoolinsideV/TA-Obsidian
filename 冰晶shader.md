@@ -2,18 +2,18 @@
 # 【注】光照计算需要考虑的东西
 
 
-![[Pasted image 20260901122001.png]]
+![[冰晶-001.png]]
 #### 一、光照因素 （受光源类型影响）（灯光数据的传递方式由RenderPath渲染路径来决定）
 
 光线方向LightDir
 衰减范围Attenuation
 光源颜色LightColor
 
-![[Pasted image 20260901122106.png]]
+![[冰晶-002.png]]
 
 前向渲染里要写：
 
-![[Pasted image 20260901123124.png]]
+![[冰晶-003.png]]
 
 
 
@@ -30,7 +30,7 @@ PBR理论框架
 
 
 
-![[Pasted image 20260901113744.jpg]]
+![[冰晶-004.jpg]]
 
 # 第一层：表面物理光学
 
